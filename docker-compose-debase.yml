@@ -1,0 +1,452 @@
+# ============================================================
+#  AgriFlow — Docker Compose complet
+#  Cible : Oracle Cloud Free Tier (ARM Ampere A1, 4 vCPU, 24 Go)
+#  Services : Airflow 2.7 + PostgreSQL 15 + MinIO + GeoServer
+#             + Grafana + Redis + Nginx reverse proxy
+# ============================================================
+
+version: '3.8'
+
+# ─── Variables communes ──────────────────────────────────────
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.7.3-python3.11
+  platform: linux/arm64          # Oracle Cloud Ampere A1 (ARM)
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_secret_2024@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow_secret_2024@postgres:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:redis_secret_2024@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: 'REMPLACER_PAR_UNE_CLE_FERNET_GENEREE'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Connexions AgriFlow
+    AIRFLOW_CONN_CDSE_CONNECTION: 'http://https://dataspace.copernicus.eu'
+    AIRFLOW_CONN_POSTGRES_DW: 'postgresql://agriflow:agriflow_secret_2024@postgres:5432/agriflow_dw'
+    AIRFLOW_CONN_MINIO_S3: 's3://minio:minio_secret_2024@minio:9000'
+    # Variables AgriFlow
+    AGRIFLOW_Q_MIN: '0.85'
+    AGRIFLOW_ALPHA: '0.40'
+    AGRIFLOW_BETA: '0.40'
+    AGRIFLOW_GAMMA: '0.20'
+    AGRIFLOW_LAMBDA_DECAY: '0.10'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config/airflow.cfg:/opt/airflow/airflow.cfg
+    - ./data:/opt/airflow/data
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+# ─── Réseau interne ─────────────────────────────────────────
+networks:
+  agriflow-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ─── Volumes persistants ─────────────────────────────────────
+volumes:
+  postgres-data:
+    driver: local
+  minio-data:
+    driver: local
+  geoserver-data:
+    driver: local
+  grafana-data:
+    driver: local
+  redis-data:
+    driver: local
+  nginx-certs:
+    driver: local
+
+# ============================================================
+services:
+
+  # ──────────────────────────────────────────────────────────
+  # 1. BASE DE DONNEES PRINCIPALE — PostgreSQL 15 + PostGIS
+  # ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:15-3.4
+    platform: linux/arm64
+    container_name: agriflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow_secret_2024
+      POSTGRES_DB: airflow
+      POSTGRES_MULTIPLE_DATABASES: agriflow_dw
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts/postgres:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.10
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '1.0'
+
+  # ──────────────────────────────────────────────────────────
+  # 2. CACHE / BROKER — Redis
+  # ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    platform: linux/arm64
+    container_name: agriflow-redis
+    restart: unless-stopped
+    command: redis-server --requirepass redis_secret_2024 --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_secret_2024", "ping"]
+      interval: 10s
+      retries: 5
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.11
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+
+  # ──────────────────────────────────────────────────────────
+  # 3. AIRFLOW — Initialisation
+  # ──────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: agriflow-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+        airflow db init
+        airflow db upgrade
+        airflow users create \
+          --username admin \
+          --firstname AgriFlow \
+          --lastname Admin \
+          --role Admin \
+          --email admin@agriflow.local \
+          --password agriflow_admin_2024
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: agriflow_admin_2024
+    user: "0:0"
+    volumes:
+      - ./dags:/sources/dags
+      - ./logs:/sources/logs
+      - ./plugins:/sources/plugins
+    networks:
+      - agriflow-net
+
+  # ──────────────────────────────────────────────────────────
+  # 4. AIRFLOW — Webserver
+  # ──────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: agriflow-airflow-webserver
+    restart: unless-stopped
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.20
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '0.75'
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────────────────
+  # 5. AIRFLOW — Scheduler
+  # ──────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: agriflow-airflow-scheduler
+    restart: unless-stopped
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.21
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '0.75'
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────────────────
+  # 6. AIRFLOW — Worker Celery
+  # ──────────────────────────────────────────────────────────
+  airflow-worker:
+    <<: *airflow-common
+    container_name: agriflow-airflow-worker
+    restart: unless-stopped
+    command: celery worker
+    environment:
+      <<: *airflow-env
+      DUMB_INIT_SETSID: "0"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" -t 10 2>&1 | grep "1 node online"'
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.22
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '1.0'
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────────────────
+  # 7. AIRFLOW — Flower (monitoring workers)
+  # ──────────────────────────────────────────────────────────
+  airflow-flower:
+    <<: *airflow-common
+    container_name: agriflow-airflow-flower
+    restart: unless-stopped
+    command: celery flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.23
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────────────────
+  # 8. STOCKAGE OBJET — MinIO (compatible S3, données rasters)
+  # ──────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    platform: linux/arm64
+    container_name: agriflow-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio_secret_2024
+      MINIO_DEFAULT_BUCKETS: sentinel2,weather,iot-raw,agriflow-staging
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"    # API S3
+      - "9001:9001"    # Console web
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.30
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+
+  # ──────────────────────────────────────────────────────────
+  # 9. MinIO — Création des buckets au démarrage
+  # ──────────────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    platform: linux/arm64
+    container_name: agriflow-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set agriflow http://minio:9000 minio minio_secret_2024;
+      mc mb --ignore-existing agriflow/sentinel2;
+      mc mb --ignore-existing agriflow/iot-raw;
+      mc mb --ignore-existing agriflow/weather;
+      mc mb --ignore-existing agriflow/agriflow-staging;
+      mc mb --ignore-existing agriflow/agriflow-outputs;
+      mc anonymous set download agriflow/agriflow-outputs;
+      echo 'Buckets MinIO initialises';
+      "
+    networks:
+      - agriflow-net
+
+  # ──────────────────────────────────────────────────────────
+  # 10. SERVEUR GEOSPATIAL — GeoServer (WMS/WFS)
+  # ──────────────────────────────────────────────────────────
+  geoserver:
+    image: kartoza/geoserver:2.24.0
+    platform: linux/arm64
+    container_name: agriflow-geoserver
+    restart: unless-stopped
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: geoserver_admin_2024
+      GEOSERVER_DATA_DIR: /opt/geoserver/data_dir
+      INITIAL_MEMORY: 512M
+      MAXIMUM_MEMORY: 1G
+      POSTGRES_JNDI_ENABLED: "true"
+      HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: agriflow_dw
+      POSTGRES_USER: agriflow
+      POSTGRES_PASS: agriflow_secret_2024
+    volumes:
+      - geoserver-data:/opt/geoserver/data_dir
+    ports:
+      - "8600:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/geoserver/web/"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.40
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '0.5'
+
+  # ──────────────────────────────────────────────────────────
+  # 11. TABLEAU DE BORD — Grafana
+  # ──────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    platform: linux/arm64
+    container_name: agriflow-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: grafana_admin_2024
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_SERVER_DOMAIN: localhost
+      GF_INSTALL_PLUGINS: grafana-worldmap-panel,grafana-clock-panel
+      # Connexion PostgreSQL automatique
+      GF_DATASOURCE_NAME: AgriFlow-PostGIS
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_HOST: postgres:5432
+      GF_DATABASE_NAME: agriflow_dw
+      GF_DATABASE_USER: agriflow
+      GF_DATABASE_PASSWORD: agriflow_secret_2024
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.50
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+
+  # ──────────────────────────────────────────────────────────
+  # 12. REVERSE PROXY — Nginx (accès unifié + HTTPS)
+  # ──────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    platform: linux/arm64
+    container_name: agriflow-nginx
+    restart: unless-stopped
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx-certs:/etc/nginx/certs
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - airflow-webserver
+      - grafana
+      - geoserver
+      - minio
+    networks:
+      agriflow-net:
+        ipv4_address: 172.20.0.60
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.1'
