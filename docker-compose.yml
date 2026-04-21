@@ -1,0 +1,69 @@
+# ============================================================
+#  AgriFlow — Docker Compose complet
+#  Cible : Oracle Cloud Free Tier (ARM Ampere A1, 4 vCPU, 24 Go)
+#  Services : Airflow 2.7 + PostgreSQL 15 + MinIO + GeoServer
+#             + Grafana + Redis + Nginx reverse proxy
+# ============================================================
+
+version: '3.8'
+
+# ─── Variables communes ──────────────────────────────────────
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.7.3-python3.11
+  platform: linux/arm64          # Oracle Cloud Ampere A1 (ARM)
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_secret_2024@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow_secret_2024@postgres:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:redis_secret_2024@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: 'REMPLACER_PAR_UNE_CLE_FERNET_GENEREE'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Connexions AgriFlow
+    AIRFLOW_CONN_CDSE_CONNECTION: 'http://https://dataspace.copernicus.eu'
+    AIRFLOW_CONN_POSTGRES_DW: 'postgresql://agriflow:agriflow_secret_2024@postgres:5432/agriflow_dw'
+    AIRFLOW_CONN_MINIO_S3: 's3://minio:minio_secret_2024@minio:9000'
+    # Variables AgriFlow
+    AGRIFLOW_Q_MIN: '0.85'
+    AGRIFLOW_ALPHA: '0.40'
+    AGRIFLOW_BETA: '0.40'
+    AGRIFLOW_GAMMA: '0.20'
+    AGRIFLOW_LAMBDA_DECAY: '0.10'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config/airflow.cfg:/opt/airflow/airflow.cfg
+    - ./data:/opt/airflow/data
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+# ─── Réseau interne ─────────────────────────────────────────
+networks:
+  agriflow-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ─── Volumes persistants ─────────────────────────────────────
+volumes:
+  postgres-data:
+    driver: local
+  minio-data:
+    driver: local
+  geoserver-data:
+    driver: local
+  grafana-data:
+    driver: local
+  redis-data:
+    driver: local
+  nginx-certs:
+    driver: local

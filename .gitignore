@@ -1,0 +1,19 @@
+# Systèmes et Python
+__pycache__/
+venv/
+.env
+.DS_Store
+*.log
+
+# LaTeX (Nettoyage des fichiers de compilation)
+*.aux
+*.out
+*.synctex.gz
+*.toc
+*.pdf
+*.blg
+*.bbl
+
+# Données lourdes (DVC gère ça)
+/data/
+/results/
